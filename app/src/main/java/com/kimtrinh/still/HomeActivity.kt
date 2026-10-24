@@ -3,9 +3,9 @@ package com.kimtrinh.still
 import android.Manifest
 import android.app.Activity
 import android.app.ActivityOptions
-import android.app.AlertDialog
 import android.content.ContentUris
 import android.content.Intent
+import android.content.pm.LauncherApps
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -14,10 +14,13 @@ import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.tv.TvContract
+import android.net.ConnectivityManager
+import android.net.Network
 import android.media.tv.TvInputManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.UserHandle
 import android.provider.MediaStore
 import android.provider.Settings
 import android.text.TextUtils
@@ -28,8 +31,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
-import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -39,8 +42,6 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.math.max
 import kotlin.math.min
 
@@ -74,6 +75,12 @@ class HomeActivity : Activity() {
     private var moveBackup: List<String> = emptyList()
     private var shownWall: String? = null
     private var wallToken = 0
+    private var clockBox: View? = null
+    private var status: TextView? = null
+    private var dockViews: List<View> = emptyList()
+    private var tipShownThisRun = false
+    private val sidebarPages = HashSet<View>()
+    private var shifted = false
 
     private class Layer(val view: View, val restore: View?, val onPop: (() -> Unit)?)
     private val stack = ArrayList<Layer>()
@@ -90,6 +97,8 @@ class HomeActivity : Activity() {
         listOf(wallView, underLayer, plate, homeLayer, overlayLayer).forEach { root.addView(it, MATCH, MATCH) }
         setContentView(root)
 
+        if (prefs[C.material] !in C.material.opts.map { it.first }) prefs[C.material] = C.material.def // "Tinted" was removed
+        getSystemService(LauncherApps::class.java)?.registerCallback(appsCallback, Ui.main)
         apps = Apps.load(this, prefs)
         home = (prefs.home ?: Apps.defaults(apps).also { prefs.home = it }).toMutableList()
         inputList = inputs()
@@ -106,6 +115,46 @@ class HomeActivity : Activity() {
             Ui.main.post { if (fresh != apps) { apps = fresh; if (moving == null) buildHome() } }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        online = cm.activeNetwork != null
+        runCatching { cm.registerDefaultNetworkCallback(netCallback) }
+        showStatus()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(netCallback) }
+    }
+
+    override fun onDestroy() {
+        getSystemService(LauncherApps::class.java)?.unregisterCallback(appsCallback)
+        super.onDestroy()
+    }
+
+    // Installs and removals while Home is on screen; bursts (an update touches several callbacks) settle first.
+    private val reloadSoon = Runnable { if (moving == null) reloadApps(null) }
+    private val appsCallback = object : LauncherApps.Callback() {
+        private fun changed() { Ui.main.removeCallbacks(reloadSoon); Ui.main.postDelayed(reloadSoon, 600) }
+        override fun onPackageRemoved(packageName: String, user: UserHandle) = changed()
+        override fun onPackageAdded(packageName: String, user: UserHandle) = changed()
+        override fun onPackageChanged(packageName: String, user: UserHandle) = changed()
+        override fun onPackagesAvailable(packageNames: Array<out String>, user: UserHandle, replacing: Boolean) = changed()
+        override fun onPackagesUnavailable(packageNames: Array<out String>, user: UserHandle, replacing: Boolean) = changed()
+    }
+
+    // ponytail: "has a default network", not "internet validated"; validation probes fail on some regional ROMs
+    private var online = true
+    private val netCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) { Ui.main.post { online = true; showStatus() } }
+        override fun onLost(network: Network) {
+            Ui.main.post { online = getSystemService(ConnectivityManager::class.java)?.activeNetwork != null; showStatus() }
+        }
+    }
+
+    private fun showStatus() { status?.visibility = if (online) View.GONE else View.VISIBLE }
 
     override fun onPause() {
         super.onPause()
@@ -146,13 +195,14 @@ class HomeActivity : Activity() {
     }
 
     private fun showWall(id: String) {
-        if (id == shownWall) return
-        shownWall = id
+        val position = prefs[C.position(id)]
+        if ("$id|$position" == shownWall) return
+        shownWall = "$id|$position"
         val t = ++wallToken
         val dm = resources.displayMetrics
         val w = max(dm.widthPixels, dm.heightPixels); val h = min(dm.widthPixels, dm.heightPixels)
         Ui.io.execute {
-            val l = Wall.load(this, id, w, h)
+            val l = Wall.load(this, id, w, h, position)
             Ui.main.post {
                 if (t != wallToken || Glass.bg != "photo") return@post
                 if (l == null) {
@@ -212,6 +262,8 @@ class HomeActivity : Activity() {
         }
         appViews.forEach { if (list) it.nextFocusRightId = controlViews.first().id else it.nextFocusUpId = controlViews.first().id }
         moving?.let { m -> buildMoveHint(apps.firstOrNull { it.pkg == m }?.label ?: "App", list) }
+        if (moving == null) buildTip(list)
+        shifted = false; updateShift(animate = false)
         if (stack.isEmpty()) onLayout(homeLayer) { focusHome() }
     }
 
@@ -225,19 +277,24 @@ class HomeActivity : Activity() {
         (appViews.firstOrNull { it.tag == lastFocusPkg } ?: appViews.firstOrNull() ?: controlViews.firstOrNull())?.requestFocus()
     }
 
+    /** Clock, plus a quiet note under it when the TV has no network: streaming apps would only fail. */
     private fun buildClock(list: Boolean) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = if (list) Gravity.END else Gravity.START }
+        homeLayer.addView(box, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or if (list) Gravity.END else Gravity.START).apply {
+            topMargin = 72.u; rightMargin = 136.u; leftMargin = 136.u
+        })
+        clockBox = box
         val mode = prefs[C.clock]
-        if (mode == "off") return
-        val f = if (mode == "24") "H:mm" else "h:mm"
-        val tc = TextClock(this).apply {
+        if (mode != "off") box.addView(TextClock(this).apply {
+            val f = if (mode == "24") "H:mm" else "h:mm"
             format12Hour = f; format24Hour = f
             setTextSize(TypedValue.COMPLEX_UNIT_PX, 60.uf); typeface = homeFont(600); setTextColor(ink)
             letterSpacing = -.02f; fontFeatureSettings = "tnum"; includeFontPadding = false
             if (Glass.bg == "photo") setShadowLayer(10.uf, 0f, 2.uf, 0x52000000)
-        }
-        homeLayer.addView(tc, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or if (list) Gravity.END else Gravity.START).apply {
-            topMargin = 72.u; rightMargin = 136.u; leftMargin = 136.u
         })
+        status = text("No Internet Connection", 27.uf, uiFont(500), dimInk).apply { setPadding(0, 12.u, 0, 0) }
+        box.addView(status)
+        showStatus()
     }
 
     private fun buildControls(list: Boolean): List<View> {
@@ -246,7 +303,6 @@ class HomeActivity : Activity() {
             add(Triple("All Apps", R.drawable.ic_grid) { allApps() })
             add(Triple("Settings", R.drawable.ic_gear) { settings() })
         }
-        val style = prefs[C.controls]
         val box = LinearLayout(this).apply {
             orientation = if (list) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
             gravity = Gravity.END
@@ -260,10 +316,10 @@ class HomeActivity : Activity() {
                 isFocusable = true; isClickable = true; id = View.generateViewId()
                 contentDescription = label; alpha = REST_CONTROL
                 setPadding(24.u, 0, 24.u, 0)
-                if (style != "icon") addView(text(label, 30.uf, homeFont(500)))
-                if (style != "name") addView(
+                addView(text(label, 30.uf, homeFont(500)))
+                addView(
                     ImageView(context).apply { setImageResource(icon); imageTintList = ColorStateList.valueOf(ink) },
-                    LinearLayout.LayoutParams(34.u, 34.u).apply { marginStart = if (style == "both") 14.u else 0 },
+                    LinearLayout.LayoutParams(34.u, 34.u).apply { marginStart = 14.u },
                 )
                 setOnFocusChangeListener { v, f ->
                     v.animate().alpha(if (f) 1f else REST_CONTROL).setDuration(Ui.T)
@@ -278,6 +334,7 @@ class HomeActivity : Activity() {
     }
 
     private fun buildList(shown: List<App>): List<View> {
+        dockViews = emptyList()
         val fs = 88.uf * sizeScale
         val rowH = (128.uf * sizeScale).toInt()
         val scroll = VScroll(this, .5f).apply { setFadingEdgeLength(220.u) }
@@ -311,11 +368,13 @@ class HomeActivity : Activity() {
         val w = min(max(shown.size, 3) * tileW + 32.u, 1504.u)
         fun lp() = FrameLayout.LayoutParams(w, tileH + 32.u, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = 136.u }
         // The mat sits under the plate layer so the focus plate reads as lying on the glass.
-        underLayer.addView(GlassBox(this, 48.uf, Glass.Kind.MAT), lp())
+        val mat = GlassBox(this, 48.uf, Glass.Kind.MAT)
+        underLayer.addView(mat, lp())
         val scroll = HScroll(this, .5f).apply { setFadingEdgeLength(132.u) }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(16.u, 16.u, 16.u, 16.u) }
         scroll.addView(row, FrameLayout.LayoutParams(WRAP, MATCH))
         homeLayer.addView(scroll, lp())
+        dockViews = listOf(mat, scroll)
         if (shown.isEmpty()) { row.addView(emptyHome()); return emptyList() }
         val style = prefs[C.show]
         return shown.map { app ->
@@ -341,9 +400,27 @@ class HomeActivity : Activity() {
     private fun buildMoveHint(label: String, list: Boolean) {
         val keys = if (list) "Up and Down" else "Left and Right"
         homeLayer.addView(
-            text("Moving “$label”. Use $keys, then OK to place it. Back cancels.", 28.uf, uiFont(500)),
+            capsule("Moving “$label”. Use $keys, then OK to place it. Back cancels."),
             FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = 168.u },
         )
+    }
+
+    /** Teaches hold-OK once per launch until the person has opened app options themselves. */
+    private fun buildTip(list: Boolean) {
+        if (prefs.learnedOptions || tipShownThisRun || appViews.isEmpty()) return
+        tipShownThisRun = true
+        val tip = capsule("Tip: hold OK on an app to move, rename or hide it.")
+        homeLayer.addView(tip, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or if (list) Gravity.START else Gravity.CENTER_HORIZONTAL).apply {
+            leftMargin = 112.u; bottomMargin = if (list) 72.u else 40.u
+        })
+        tip.alpha = 0f
+        tip.animate().alpha(1f).setStartDelay(800).setDuration(Ui.T)
+        Ui.main.postDelayed({ tip.animate().alpha(0f).setDuration(400).withEndAction { (tip.parent as? ViewGroup)?.removeView(tip) } }, 9000)
+    }
+
+    private fun capsule(s: String) = GlassBox(this, 36.uf, Glass.Kind.PANEL).apply {
+        setPadding(32.u, 18.u, 32.u, 18.u)
+        addView(text(s, 27.uf, uiFont(500), shadow = false))
     }
 
     private fun appIcon(app: App, size: Int) = ImageView(this).apply {
@@ -371,7 +448,8 @@ class HomeActivity : Activity() {
                 if (f) plate.moveTo(v, radius)
             } else {
                 if (list) { v.pivotX = 0f; v.pivotY = v.height / 2f }
-                val s = if (f) 1.06f else 1f
+                if (Glass.bg == "photo") liftShadow(v, f)
+                val s = if (f) 1.08f else 1f
                 v.animate().scaleX(s).scaleY(s).setDuration(Ui.T).setInterpolator(Ui.EASE)
                 if (f) plate.hide()
             }
@@ -379,6 +457,11 @@ class HomeActivity : Activity() {
         v.setOnClickListener { press(v) { launch(app, v) } }
         v.setOnLongClickListener { appOptions(app); true }
         v.setOnKeyListener(menuKey)
+    }
+
+    private fun liftShadow(v: View, on: Boolean) {
+        if (v is TextView) v.setShadowLayer(if (on) 24.uf else 10.uf, 0f, if (on) 8.uf else 2.uf, if (on) 0x80000000.toInt() else 0x52000000)
+        if (v is ViewGroup) for (i in 0 until v.childCount) liftShadow(v.getChildAt(i), on)
     }
 
     /** tvOS-style press: a brief dip before acting. */
@@ -455,6 +538,7 @@ class HomeActivity : Activity() {
     }
 
     private fun appOptions(app: App) {
+        prefs.learnedOptions = true
         val onHome = app.pkg in home
         val a = ArrayList<Pair<String, () -> Unit>>()
         if (onHome && stack.isEmpty()) a += "Move" to { startMove(app) }
@@ -477,6 +561,7 @@ class HomeActivity : Activity() {
         (stack.lastOrNull()?.view as? ViewGroup ?: homeLayer).descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
         overlayLayer.addView(v, MATCH, MATCH)
         stack += Layer(v, restore, onPop)
+        updateShift()
         v.alpha = 0f
         v.animate().alpha(1f).setDuration(Ui.T).setInterpolator(Ui.EASE)
         onLayout(v) { if (stack.lastOrNull()?.view === v) (focus ?: v).requestFocus() }
@@ -485,6 +570,8 @@ class HomeActivity : Activity() {
     private fun pop(): Boolean {
         val l = stack.removeLastOrNull() ?: return false
         overlayLayer.removeView(l.view)
+        sidebarPages.remove(l.view)
+        updateShift()
         val below = stack.lastOrNull()?.view
         (below as? ViewGroup ?: homeLayer).descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         l.onPop?.invoke()
@@ -499,6 +586,29 @@ class HomeActivity : Activity() {
     }
 
     private fun closeAll() { while (pop()) Unit }
+
+    /**
+     * While a Settings page is open, slide what it would cover (the clock in List, the dock in Dock)
+     * into the visible part of the screen, so every change previews live.
+     */
+    private fun updateShift(animate: Boolean = true) {
+        val on = stack.any { it.view in sidebarPages }
+        if (on == shifted) return
+        shifted = on
+        val panelLeft = 1920.uf - 880.uf - 40.uf // panel width + right margin, plus breathing room
+        clockBox?.takeIf { prefs[C.layout] == "list" }?.let { c ->
+            val dx = if (on) panelLeft - (1920.uf - 136.uf) else 0f
+            if (animate) c.animate().translationX(dx).setDuration(Ui.T + 80).setInterpolator(Ui.EASE) else c.translationX = dx
+        }
+        dockViews.forEach { d ->
+            val w = d.width.takeIf { it > 0 }?.toFloat() ?: (d.layoutParams.width.toFloat())
+            val sc = if (on) min(1f, (panelLeft - 80.uf) / w) else 1f
+            val dx = if (on) (80.uf + panelLeft) / 2f - 960.uf else 0f
+            if (animate) d.animate().translationX(dx).scaleX(sc).scaleY(sc).setDuration(Ui.T + 80).setInterpolator(Ui.EASE)
+                .setUpdateListener { d.invalidate() } // the mat re-reads its glass offset
+            else { d.translationX = dx; d.scaleX = sc; d.scaleY = sc }
+        }
+    }
 
     private fun refreshRows(v: View) {
         (v.tag as? Runnable)?.run()
@@ -527,11 +637,11 @@ class HomeActivity : Activity() {
 
     /** Right-hand sidebar, like tvOS Settings, so Home stays visible as a live preview. */
     private fun sidebar(title: String, note: String? = null, fill: (LinearLayout) -> Unit): FrameLayout {
-        val page = FrameLayout(this)
+        val page = FrameLayout(this).also { sidebarPages += it }
         val panel = GlassBox(this, 44.uf, Glass.Kind.PANEL).apply { setPadding(36.u, 56.u, 36.u, 0) }
         panel.addView(text(title, 48.uf, uiFont(700), shadow = false).apply { setPadding(32.u, 0, 32.u, 0) })
         note?.let {
-            panel.addView(text(it, 25.uf, uiFont(400), dimInk, false).apply {
+            panel.addView(text(it, 27.uf, uiFont(400), dimInk, false).apply {
                 isSingleLine = false; maxLines = 4; setLineSpacing(0f, 1.15f); setPadding(32.u, 14.u, 32.u, 0)
             })
         }
@@ -558,7 +668,7 @@ class HomeActivity : Activity() {
     private fun row(
         list: LinearLayout, label: String,
         value: (() -> String)? = null, checked: (() -> Boolean)? = null, chevron: Boolean = false,
-        leading: View? = null, icon: Int = 0, center: Boolean = false,
+        leading: View? = null, icon: Int = 0, center: Boolean = false, visible: (() -> Boolean)? = null,
         onFocus: ((Boolean) -> Unit)? = null, onClick: (View) -> Unit,
     ): View {
         val r = LinearLayout(this).apply {
@@ -594,6 +704,7 @@ class HomeActivity : Activity() {
         r.tag = Runnable {
             vt?.text = value?.invoke()
             ck?.visibility = if (checked?.invoke() == true) View.VISIBLE else View.INVISIBLE
+            visible?.let { r.visibility = if (it()) View.VISIBLE else View.GONE }
         }
         (r.tag as Runnable).run(); paint(false)
         r.setOnClickListener { onClick(r) }
@@ -607,7 +718,7 @@ class HomeActivity : Activity() {
         val card = GlassBox(this, 44.uf, Glass.Kind.PANEL).apply { gravity = Gravity.CENTER_HORIZONTAL; setPadding(44.u, 48.u, 44.u, 36.u) }
         card.addView(text(title, 40.uf, uiFont(700), shadow = false).apply { gravity = Gravity.CENTER; isSingleLine = false; maxLines = 3 }, LinearLayout.LayoutParams(MATCH, WRAP))
         message?.let {
-            card.addView(text(it, 25.uf, uiFont(400), dimInk, false).apply {
+            card.addView(text(it, 27.uf, uiFont(400), dimInk, false).apply {
                 gravity = Gravity.CENTER; isSingleLine = false; maxLines = 14; setLineSpacing(0f, 1.18f); setPadding(0, 18.u, 0, 0)
             }, LinearLayout.LayoutParams(MATCH, WRAP))
         }
@@ -621,18 +732,31 @@ class HomeActivity : Activity() {
         push(page)
     }
 
+    /** Text entry as a glass sheet, matching the rest of Still instead of the grey system dialog. */
     private fun ask(title: String, initial: String, hint: String, done: (String) -> Unit) {
+        val imm = getSystemService(InputMethodManager::class.java)
+        val page = FrameLayout(this).apply { setBackgroundColor(0x80000000.toInt()) }
+        val card = GlassBox(this, 44.uf, Glass.Kind.PANEL).apply { gravity = Gravity.CENTER_HORIZONTAL; setPadding(44.u, 48.u, 44.u, 36.u) }
+        card.addView(text(title, 40.uf, uiFont(700), shadow = false).apply { gravity = Gravity.CENTER; isSingleLine = false; maxLines = 2 }, LinearLayout.LayoutParams(MATCH, WRAP))
         val e = EditText(this).apply {
             setText(initial); this.hint = hint; isSingleLine = true; setSelectAllOnFocus(true)
             imeOptions = EditorInfo.IME_ACTION_DONE
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, 31.uf); typeface = uiFont(500)
+            setTextColor(0xFF1C1C1E.toInt()); setHintTextColor(0x801C1C1E.toInt())
+            background = GradientDrawable().apply { cornerRadius = 18.uf; setColor(Color.WHITE) }
+            setPadding(28.u, 0, 28.u, 0)
         }
-        val d = AlertDialog.Builder(this).setTitle(title)
-            .setView(FrameLayout(this).apply { setPadding(48.u, 16.u, 48.u, 0); addView(e) })
-            .setPositiveButton("OK") { _, _ -> done(e.text.toString()) }
-            .setNegativeButton("Cancel", null).create()
-        e.setOnEditorActionListener { _, a, _ -> (a == EditorInfo.IME_ACTION_DONE).also { if (it) { done(e.text.toString()); d.dismiss() } } }
-        d.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
-        d.show()
+        card.addView(e, LinearLayout.LayoutParams(MATCH, 84.u).apply { topMargin = 32.u; leftMargin = 8.u; rightMargin = 8.u })
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false; clipToPadding = false; setPadding(8.u, 20.u, 8.u, 0) }
+        card.addView(list, LinearLayout.LayoutParams(MATCH, WRAP))
+        fun submit() { imm?.hideSoftInputFromWindow(e.windowToken, 0); val v = e.text.toString(); pop(); done(v) }
+        row(list, "Done", center = true) { submit() }
+        row(list, "Cancel", center = true) { imm?.hideSoftInputFromWindow(e.windowToken, 0); pop() }
+        e.setOnEditorActionListener { _, a, _ -> (a == EditorInfo.IME_ACTION_DONE).also { if (it) submit() } }
+        // Upper third: the on-screen keyboard takes the bottom half of the screen.
+        page.addView(card, FrameLayout.LayoutParams(860.u, WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = 96.u })
+        push(page, e)
+        e.postDelayed({ if (e.hasFocus()) imm?.showSoftInput(e, 0) }, 300)
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -653,14 +777,21 @@ class HomeActivity : Activity() {
         val visible = apps.filter { it.pkg !in hidden }
         var focus: View? = null
         val cols = 5; val gap = 48.u; val tileW = (1692.u - gap * (cols - 1)) / cols; val tileH = tileW * 9 / 16
-        visible.chunked(cols).forEach { chunk ->
-            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; clipChildren = false }
-            chunk.forEachIndexed { i, app ->
-                val t = appTile(app, tileW, tileH)
-                r.addView(t, LinearLayout.LayoutParams(tileW, WRAP).apply { if (i > 0) marginStart = gap })
-                if (app.pkg == focusPkg) focus = t
+        val (tv, other) = visible.partition { it.tv }
+        for ((title, group) in listOf(null to tv, "Other Apps" to other)) {
+            if (group.isEmpty()) continue
+            if (title != null && tv.isNotEmpty()) grid.addView(text(title.uppercase(), 24.uf, uiFont(600), dimInk, false).apply {
+                letterSpacing = .06f; setPadding(0, 16.u, 0, 28.u)
+            })
+            group.chunked(cols).forEach { chunk ->
+                val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; clipChildren = false }
+                chunk.forEachIndexed { i, app ->
+                    val t = appTile(app, tileW, tileH)
+                    r.addView(t, LinearLayout.LayoutParams(tileW, WRAP).apply { if (i > 0) marginStart = gap })
+                    if (app.pkg == focusPkg) focus = t
+                }
+                grid.addView(r, LinearLayout.LayoutParams(WRAP, WRAP).apply { bottomMargin = 44.u })
             }
-            grid.addView(r, LinearLayout.LayoutParams(WRAP, WRAP).apply { bottomMargin = 44.u })
         }
         if (visible.isEmpty()) grid.addView(text("No apps found.", 34.uf, uiFont(500), dimInk, false))
         push(page, focus)
@@ -676,8 +807,7 @@ class HomeActivity : Activity() {
             setBackgroundColor(0x33FFFFFF)
         }
         Icons.into(img, app.pkg, Icons.Kind.TILE, w, h)
-        val name = (if (app.pkg in home) "${app.label}  ·  On Home" else app.label)
-        val label = text(name, 25.uf, uiFont(500), ink, false).apply { gravity = Gravity.CENTER; alpha = .6f }
+        val label = text(app.label, 27.uf, uiFont(500), ink, false).apply { gravity = Gravity.CENTER; alpha = .6f }
         t.addView(img, LinearLayout.LayoutParams(w, h))
         t.addView(label, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = 18.u })
         t.setOnFocusChangeListener { _, f ->
@@ -695,7 +825,7 @@ class HomeActivity : Activity() {
 
     private fun settings() = push(sidebar("Settings") { l ->
         header(l, "Appearance")
-        C.appearance.forEach { c -> row(l, c.title, value = { c.label(prefs[c]) }, chevron = true) { choicePage(c) } }
+        C.appearance.forEach { c -> row(l, c.title, value = { c.label(prefs[c]) }, chevron = true, visible = { applies(c) }) { choicePage(c) } }
         header(l, "Wallpaper")
         row(l, "Wallpaper", value = { Wall.name(this, prefs.wallpaper) }, chevron = true) { wallpaperPage() }
         row(l, C.rotation.title, value = { C.rotation.label(prefs[C.rotation]) }, chevron = true) { choicePage(C.rotation) }
@@ -710,8 +840,15 @@ class HomeActivity : Activity() {
         row(l, "About Still", chevron = true) { about() }
     })
 
+    /** Options with no visible effect in the current setup are hidden rather than left as dead ends. */
+    private fun applies(c: Choice) = when (c) {
+        C.material -> Glass.bg == "photo"
+        C.icons -> prefs[C.show] != "name"
+        else -> true
+    }
+
     private fun choicePage(c: Choice) {
-        val note = when (c) {
+        val note = if (c.key.startsWith("pos:")) "Choose which part of the photo stays on screen. Square and portrait photos move up and down; wide ones move left and right." else when (c) {
             C.material -> "Material applies to the glass over photo backgrounds."
             C.focus -> "Glass places a plate behind the focused app. Lift enlarges it instead."
             C.icons -> "Monochrome uses each app's glyph where it has one."
@@ -737,10 +874,12 @@ class HomeActivity : Activity() {
         var focus: View? = null
         val note = if (Glass.bg != "photo") "Wallpaper shows when Background is set to Photo." else null
         val page = sidebar("Wallpaper", note) { l ->
+            // Leaving the photo rows drops any preview, so these rows always describe the wallpaper in use.
+            val showCurrent: (Boolean) -> Unit = { f -> if (f) { Ui.main.removeCallbacks(preview); previewId = prefs.wallpaper; Ui.main.postDelayed(preview, 350) } }
             header(l, "Your Photos")
-            row(l, "Photo Folder", value = { folderName() ?: "None" }, chevron = true) { withPhotos { loadThen({ Wall.folders(this) }, ::folderPage) } }
-            row(l, "Add a Photo from This TV", icon = R.drawable.ic_image, chevron = true) { withPhotos { loadThen(::recentPhotos, ::galleryPage) } }
-            row(l, "Download from a Link", icon = R.drawable.ic_link, chevron = true) { askUrl() }
+            row(l, "Photo Folder", value = { folderName() ?: "None" }, chevron = true, onFocus = showCurrent) { withPhotos { loadThen({ Wall.folders(this) }, ::folderPage) } }
+            row(l, "Add a Photo from This TV", icon = R.drawable.ic_image, chevron = true, onFocus = showCurrent) { withPhotos { loadThen(::recentPhotos, ::galleryPage) } }
+            row(l, "Position", value = { C.position(prefs.wallpaper).let { it.label(prefs[it]) } }, chevron = true, onFocus = showCurrent) { choicePage(C.position(prefs.wallpaper)) }
             header(l, "Photos")
             for ((id, name) in Wall.all(this)) {
                 val th = thumb()
@@ -865,13 +1004,6 @@ class HomeActivity : Activity() {
         if (code == REQ_DOC && result == RESULT_OK && uri != null) importWall { contentResolver.openInputStream(uri)!! }
     }
 
-    private fun askUrl() = ask("Download from a Link", "", "https://example.com/photo.jpg") { s ->
-        val url = s.trim().let { if (it.contains("://")) it else "https://$it" }
-        importWall {
-            (URL(url).openConnection() as HttpURLConnection).apply { connectTimeout = 15_000; readTimeout = 20_000 }.inputStream
-        }
-    }
-
     /** Copies a photo into app storage at screen size, so it needs no permission or network later. */
     private fun importWall(open: () -> InputStream) {
         toast("Adding photo…")
@@ -948,7 +1080,7 @@ class HomeActivity : Activity() {
 
     private fun homeState() = when {
         isDefaultHome() -> "Still"
-        HomeButtonService.enabled(this) -> "Home Button"
+        HomeButtonService.enabled(this) -> "Still (Accessibility)"
         else -> "Not Set"
     }
 

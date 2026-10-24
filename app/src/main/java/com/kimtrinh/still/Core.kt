@@ -62,9 +62,8 @@ object C {
     val layout = Choice("layout", "Layout", "list", "list" to "List", "dock" to "Dock")
     val show = Choice("show", "App Style", "both", "name" to "Names", "icon" to "Icons", "both" to "Icons and Names")
     val icons = Choice("icons", "Icon Color", "mono", "mono" to "Monochrome", "color" to "Full Color")
-    val controls = Choice("controls", "Control Style", "both", "name" to "Names", "icon" to "Icons", "both" to "Icons and Names")
     val focus = Choice("focus", "Focus Style", "glass", "glass" to "Glass", "lift" to "Lift")
-    val material = Choice("material", "Material", "clear", "clear" to "Clear", "frost" to "Frosted", "tint" to "Tinted")
+    val material = Choice("material", "Material", "clear", "clear" to "Clear", "frost" to "Frosted")
     val size = Choice("size", "Text Size", "m", "s" to "Small", "m" to "Medium", "l" to "Large")
     val font = Choice(
         "font", "Typeface", "Inter",
@@ -77,7 +76,13 @@ object C {
         "off" to "Never", "open" to "Each Time Home Opens", "5" to "Every 5 Minutes",
         "15" to "Every 15 Minutes", "60" to "Every Hour",
     )
-    val appearance = listOf(background, layout, show, icons, controls, focus, material, size, font, clock)
+    val appearance = listOf(background, layout, show, icons, focus, material, size, font, clock)
+
+    /** Per photo: which part of it stays on screen when it is cropped to 16:9. */
+    fun position(wallId: String) = Choice(
+        "pos:$wallId", "Position", "center",
+        "center" to "Center", "top" to "Top", "bottom" to "Bottom", "left" to "Left", "right" to "Right",
+    )
 }
 
 class Prefs(ctx: Context) {
@@ -99,6 +104,10 @@ class Prefs(ctx: Context) {
     var folderName: String?
         get() = sp.getString("folderName", null)
         set(v) = sp.edit().putString("folderName", v).apply()
+    /** Set once the person has opened app options, so Home stops teaching hold-OK. */
+    var learnedOptions: Boolean
+        get() = sp.getBoolean("learnedOptions", false)
+        set(v) = sp.edit().putBoolean("learnedOptions", v).apply()
     var hidden: Set<String>
         get() = sp.getStringSet("hidden", emptySet())!!.toSet()
         set(v) = sp.edit().putStringSet("hidden", v).apply()
@@ -307,12 +316,12 @@ object Wall {
         return if (deg == 0f) b else Bitmap.createBitmap(b, 0, 0, b.width, b.height, Matrix().apply { setRotate(deg) }, true)
     }
 
-    fun load(ctx: Context, id: String, w: Int, h: Int): Loaded? {
+    fun load(ctx: Context, id: String, w: Int, h: Int, position: String = "center"): Loaded? {
         // Low-RAM TVs get a half-resolution 16-bit photo: 1 MB instead of 8 MB.
         val low = ctx.getSystemService(ActivityManager::class.java).isLowRamDevice
         val tw = if (low) w / 2 else w; val th = if (low) h / 2 else h
         val config = if (low) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
-        val photo = runCatching { decode({ open(ctx, id) }, tw, th, config)?.let { cover(it, tw, th, config) } }.getOrNull() ?: return null
+        val photo = runCatching { decode({ open(ctx, id) }, tw, th, config)?.let { cover(it, tw, th, config, position) } }.getOrNull() ?: return null
         val blur = blur(photo)
         var lum = 0L
         val px = IntArray(blur.width * blur.height).also { blur.getPixels(it, 0, blur.width, 0, 0, blur.width, blur.height) }
@@ -321,10 +330,13 @@ object Wall {
     }
 
     /** Crops to exactly w×h, so a square or 12 MP photo costs no more than one screen of pixels. */
-    private fun cover(src: Bitmap, w: Int, h: Int, config: Bitmap.Config): Bitmap {
+    private fun cover(src: Bitmap, w: Int, h: Int, config: Bitmap.Config, position: String): Bitmap {
         if (src.width == w && src.height == h) return src
         val sc = max(w / src.width.toFloat(), h / src.height.toFloat())
-        val m = Matrix().apply { setScale(sc, sc); postTranslate((w - src.width * sc) / 2f, (h - src.height * sc) / 2f) }
+        // Which edge to keep when cropping; only the axis that overflows actually moves.
+        val fx = when (position) { "left" -> 0f; "right" -> 1f; else -> .5f }
+        val fy = when (position) { "top" -> 0f; "bottom" -> 1f; else -> .5f }
+        val m = Matrix().apply { setScale(sc, sc); postTranslate((w - src.width * sc) * fx, (h - src.height * sc) * fy) }
         val out = Bitmap.createBitmap(w, h, config)
         Canvas(out).drawBitmap(src, m, Paint(Paint.FILTER_BITMAP_FLAG))
         src.recycle() // never shown, so safe to free right away
@@ -400,8 +412,8 @@ object Glass {
         veil.color = when {
             photo -> when (kind) {
                 Kind.PANEL -> if (lightPhoto) 0x80000000.toInt() else 0x66000000
-                Kind.MAT -> when (material) { "frost" -> 0x29FFFFFF; "tint" -> 0x38000000; else -> 0x0FFFFFFF }
-                Kind.PLATE -> when (material) { "frost" -> 0x47FFFFFF; "tint" -> 0x24FFFFFF; else -> 0x2EFFFFFF }
+                Kind.MAT -> if (material == "frost") 0x29FFFFFF else 0x0FFFFFFF
+                Kind.PLATE -> if (material == "frost") 0x47FFFFFF else 0x2EFFFFFF
                 Kind.LIFT -> 0x5CFFFFFF
             }
             light -> when (kind) {
@@ -515,8 +527,11 @@ class PlateLayer(ctx: Context) : View(ctx), android.view.ViewTreeObserver.OnPreD
     private fun bounds(v: View, out: RectF) {
         getLocationInWindow(loc); v.getLocationInWindow(vloc)
         val l = (vloc[0] - loc[0]).toFloat(); val t = (vloc[1] - loc[1]).toFloat()
-        // Scaled views report their unscaled size; the plate wraps the visual bounds.
-        out.set(l, t, l + v.width * v.scaleX, t + v.height * v.scaleY)
+        // Scaled views (or scaled parents, like the dock during a Settings preview) report their
+        // unscaled size; the plate wraps the visual bounds.
+        var sx = 1f; var sy = 1f; var p: View? = v
+        while (p != null) { sx *= p.scaleX; sy *= p.scaleY; p = p.parent as? View }
+        out.set(l, t, l + v.width * sx, t + v.height * sy)
     }
 
     fun moveTo(v: View, rad: Float) {

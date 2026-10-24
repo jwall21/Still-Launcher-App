@@ -25,6 +25,8 @@ Undo with `../projector home-stock` or by turning the service off. Still's Setti
 ## Remote
 
 - OK opens. Hold OK (or Menu) on an app: Move, Add/Remove from Home, Rename, Hide, App Info, Uninstall.
+- Settings → Wallpaper: built-in photos, a photo folder on the TV or a USB drive, or a single photo,
+  with a per-photo Position. Still has no network access of its own (no INTERNET permission).
 - Right from the list reaches Inputs / All Apps / Settings. Back closes one panel at a time.
 
 ## Layout of the code
