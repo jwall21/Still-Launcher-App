@@ -95,6 +95,10 @@ class Prefs(ctx: Context) {
     var folder: String?
         get() = sp.getString("folder", null)
         set(v) = sp.edit().apply { if (v == null) remove("folder") else putString("folder", v) }.apply()
+    /** Kept beside [folder] so Settings can show it without scanning the photo library. */
+    var folderName: String?
+        get() = sp.getString("folderName", null)
+        set(v) = sp.edit().putString("folderName", v).apply()
     var hidden: Set<String>
         get() = sp.getStringSet("hidden", emptySet())!!.toSet()
         set(v) = sp.edit().putStringSet("hidden", v).apply()
@@ -236,7 +240,7 @@ object Wall {
         "forest" to "Forest Mist", "summit" to "Sunlit Summits", "golden" to "Golden Hour",
     )
 
-    class Loaded(val id: String, val photo: Bitmap, val blur: Bitmap, val light: Boolean)
+    class Loaded(val photo: Bitmap, val blur: Bitmap, val light: Boolean)
 
     fun dir(ctx: Context) = File(ctx.filesDir, "walls").apply { mkdirs() }
 
@@ -306,14 +310,25 @@ object Wall {
     fun load(ctx: Context, id: String, w: Int, h: Int): Loaded? {
         // Low-RAM TVs get a half-resolution 16-bit photo: 1 MB instead of 8 MB.
         val low = ctx.getSystemService(ActivityManager::class.java).isLowRamDevice
-        val photo = runCatching {
-            if (low) decode({ open(ctx, id) }, w / 2, h / 2, Bitmap.Config.RGB_565) else decode({ open(ctx, id) }, w, h)
-        }.getOrNull() ?: return null
+        val tw = if (low) w / 2 else w; val th = if (low) h / 2 else h
+        val config = if (low) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
+        val photo = runCatching { decode({ open(ctx, id) }, tw, th, config)?.let { cover(it, tw, th, config) } }.getOrNull() ?: return null
         val blur = blur(photo)
         var lum = 0L
         val px = IntArray(blur.width * blur.height).also { blur.getPixels(it, 0, blur.width, 0, 0, blur.width, blur.height) }
         for (p in px) lum += (p shr 16 and 255) * 3 + (p shr 8 and 255) * 6 + (p and 255)
-        return Loaded(id, photo, blur, lum / px.size / 10 > 150)
+        return Loaded(photo, blur, lum / px.size / 10 > 150)
+    }
+
+    /** Crops to exactly w×h, so a square or 12 MP photo costs no more than one screen of pixels. */
+    private fun cover(src: Bitmap, w: Int, h: Int, config: Bitmap.Config): Bitmap {
+        if (src.width == w && src.height == h) return src
+        val sc = max(w / src.width.toFloat(), h / src.height.toFloat())
+        val m = Matrix().apply { setScale(sc, sc); postTranslate((w - src.width * sc) / 2f, (h - src.height * sc) / 2f) }
+        val out = Bitmap.createBitmap(w, h, config)
+        Canvas(out).drawBitmap(src, m, Paint(Paint.FILTER_BITMAP_FLAG))
+        src.recycle() // never shown, so safe to free right away
+        return out
     }
 
     /** Glass material, rendered once per photo: halve to ~240px, then three box passes ≈ gaussian. */
@@ -436,7 +451,11 @@ class WallView(ctx: Context) : View(ctx) {
         prev = cur; cur = b; fade = 0f
         ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 450
-            addUpdateListener { fade = it.animatedValue as Float; invalidate() }
+            addUpdateListener {
+                fade = it.animatedValue as Float
+                if (fade >= 1f) prev = null // let the old photo go once it's no longer visible
+                invalidate()
+            }
             start()
         }
     }

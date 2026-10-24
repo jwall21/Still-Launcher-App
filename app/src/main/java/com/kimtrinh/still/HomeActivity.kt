@@ -49,6 +49,12 @@ private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 private const val REQ_DOC = 1
 private const val REQ_PERM = 2
 
+// Resting opacity of unfocused items: high enough to read over a bright photo at 3 m.
+private const val REST_CONTROL = .8f
+private const val REST_GLASS_PHOTO = .84f
+private const val REST_GLASS_FLAT = .72f
+private const val REST_LIFT = .6f
+
 class HomeActivity : Activity() {
     private lateinit var prefs: Prefs
     private lateinit var root: FrameLayout
@@ -87,8 +93,8 @@ class HomeActivity : Activity() {
         apps = Apps.load(this, prefs)
         home = (prefs.home ?: Apps.defaults(apps).also { prefs.home = it }).toMutableList()
         inputList = inputs()
-        if (saved == null && prefs[C.rotation] == "open") advanceWallpaper(show = false)
         applyPrefs()
+        if (saved == null && prefs[C.rotation] == "open") advanceWallpaper()
     }
 
     override fun onResume() {
@@ -124,7 +130,7 @@ class HomeActivity : Activity() {
     // ---------- Appearance ----------
 
     private val ink get() = Glass.ink
-    private val dimInk get() = (Glass.ink and 0xFFFFFF) or 0x99000000.toInt()
+    private val dimInk get() = (Glass.ink and 0xFFFFFF) or 0xB3000000.toInt() // 70%: secondary text stays legible on glass
     private val sizeScale get() = when (prefs[C.size]) { "s" -> .82f; "l" -> 1.18f; else -> 1f }
     private fun homeFont(w: Int) = Fonts.get(this, prefs[C.font], w)
     private fun uiFont(w: Int) = Fonts.get(this, "Inter", w)
@@ -149,7 +155,13 @@ class HomeActivity : Activity() {
             val l = Wall.load(this, id, w, h)
             Ui.main.post {
                 if (t != wallToken || Glass.bg != "photo") return@post
-                if (l == null) { toast("That wallpaper couldn't be loaded."); return@post }
+                if (l == null) {
+                    // Deleted photo or unplugged USB drive: show a built-in photo rather than a black Home.
+                    // The choice is kept, so the photo comes back when the drive does.
+                    val fallback = Wall.BUILTIN.first().first
+                    if (id != fallback) { toast("That wallpaper isn't available right now."); shownWall = null; showWall(fallback) }
+                    return@post
+                }
                 Glass.wall = l; wallView.set(l.photo); invalidateTree(root)
             }
         }
@@ -171,10 +183,12 @@ class HomeActivity : Activity() {
     private fun rotationSet() =
         prefs.folder?.let { Wall.folderPhotos(this, it).ifEmpty { null } } ?: Wall.all(this).map { it.first }
 
-    private fun advanceWallpaper(show: Boolean = true) {
-        val all = rotationSet()
-        prefs.wallpaper = all[(all.indexOf(prefs.wallpaper) + 1).mod(all.size)]
-        if (show && Glass.bg == "photo") showWall(prefs.wallpaper)
+    private fun advanceWallpaper() = Ui.io.execute {
+        val all = rotationSet() // may scan the photo library, so not on the main thread
+        Ui.main.post {
+            prefs.wallpaper = all[(all.indexOf(prefs.wallpaper) + 1).mod(all.size)]
+            if (Glass.bg == "photo") showWall(prefs.wallpaper)
+        }
     }
 
     // ---------- Home ----------
@@ -244,7 +258,7 @@ class HomeActivity : Activity() {
             LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
                 isFocusable = true; isClickable = true; id = View.generateViewId()
-                contentDescription = label; alpha = .66f
+                contentDescription = label; alpha = REST_CONTROL
                 setPadding(24.u, 0, 24.u, 0)
                 if (style != "icon") addView(text(label, 30.uf, homeFont(500)))
                 if (style != "name") addView(
@@ -252,7 +266,7 @@ class HomeActivity : Activity() {
                     LinearLayout.LayoutParams(34.u, 34.u).apply { marginStart = if (style == "both") 14.u else 0 },
                 )
                 setOnFocusChangeListener { v, f ->
-                    v.animate().alpha(if (f) 1f else .66f).setDuration(Ui.T)
+                    v.animate().alpha(if (f) 1f else REST_CONTROL).setDuration(Ui.T)
                     if (f && stack.isEmpty()) plate.moveTo(v, 36.uf)
                 }
                 setOnClickListener { press(this, action) }
@@ -345,7 +359,7 @@ class HomeActivity : Activity() {
         v.isFocusable = true; v.isClickable = true; v.id = View.generateViewId(); v.tag = app.pkg
         v.contentDescription = app.label
         val glass = prefs[C.focus] == "glass"
-        val rest = if (!glass) .6f else if (Glass.bg == "photo") .84f else .72f
+        val rest = if (!glass) REST_LIFT else if (Glass.bg == "photo") REST_GLASS_PHOTO else REST_GLASS_FLAT
         v.alpha = if (app.pkg == moving) 1f else rest
         v.setOnFocusChangeListener { _, f ->
             if (f) {
@@ -430,11 +444,14 @@ class HomeActivity : Activity() {
     }
 
     /** Re-reads apps after a rename, hide or membership change, and refreshes whatever is open. */
-    private fun reloadApps(focusPkg: String?) {
-        apps = Apps.load(this, prefs)
-        buildHome()
-        val top = stack.lastOrNull()?.view ?: return
-        if (top.tag == "apps") { pop(); allApps(focusPkg) } else refreshRows(top)
+    private fun reloadApps(focusPkg: String?) = Ui.io.execute {
+        val fresh = Apps.load(this, prefs) // queries every launcher activity: too slow for the main thread
+        Ui.main.post {
+            apps = fresh
+            buildHome()
+            val top = stack.lastOrNull()?.view ?: return@post
+            if (top.tag == "apps") { pop(); allApps(focusPkg) } else refreshRows(top)
+        }
     }
 
     private fun appOptions(app: App) {
@@ -526,14 +543,15 @@ class HomeActivity : Activity() {
         scroll.addView(list)
         panel.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f).apply { topMargin = 12.u })
         fill(list)
-        page.addView(panel, FrameLayout.LayoutParams(800.u, MATCH, Gravity.END).apply { setMargins(0, 32.u, 32.u, 32.u) })
+        // Inside the TV safe area: keystone correction and overscan crop the outer edges.
+        page.addView(panel, FrameLayout.LayoutParams(800.u, MATCH, Gravity.END).apply { setMargins(0, 60.u, 80.u, 60.u) })
         panel.translationX = 60.uf
         panel.animate().translationX(0f).setDuration(Ui.T + 80).setInterpolator(Ui.EASE)
         return page
     }
 
     private fun header(list: LinearLayout, s: String) = list.addView(
-        text(s.uppercase(), 22.uf, uiFont(600), dimInk, false).apply { letterSpacing = .06f; setPadding(28.u, 30.u, 28.u, 8.u) },
+        text(s.uppercase(), 24.uf, uiFont(600), dimInk, false).apply { letterSpacing = .06f; setPadding(28.u, 30.u, 28.u, 8.u) },
     )
 
     /** A grouped-list row. Focus turns it into a white plate with dark text, as on tvOS. */
@@ -560,7 +578,7 @@ class HomeActivity : Activity() {
         val ch = if (chevron) ImageView(this).apply { setImageResource(R.drawable.ic_chevron) }.also { v -> r.addView(v, LinearLayout.LayoutParams(26.u, 26.u).apply { marginStart = 10.u }) } else null
         fun paint(f: Boolean) {
             val fg = if (f) 0xFF1C1C1E.toInt() else ink
-            val dim = (fg and 0xFFFFFF) or 0x99000000.toInt()
+            val dim = (fg and 0xFFFFFF) or 0xB3000000.toInt()
             bg.setColor(if (f) Color.WHITE else Color.TRANSPARENT)
             t.setTextColor(fg); vt?.setTextColor(dim)
             ic?.imageTintList = ColorStateList.valueOf(fg); ck?.imageTintList = ColorStateList.valueOf(fg)
@@ -625,7 +643,7 @@ class HomeActivity : Activity() {
         val page = GlassBox(this, 0f, Glass.Kind.PANEL).apply { tag = "apps" }
         val top = FrameLayout(this)
         top.addView(text("All Apps", 56.uf, uiFont(700), shadow = false), FrameLayout.LayoutParams(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL))
-        top.addView(text("Hold OK for options", 24.uf, uiFont(500), dimInk, false), FrameLayout.LayoutParams(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL))
+        top.addView(text("Hold OK for options", 27.uf, uiFont(500), dimInk, false), FrameLayout.LayoutParams(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL))
         page.addView(top, LinearLayout.LayoutParams(MATCH, WRAP).apply { setMargins(114.u, 64.u, 114.u, 0) })
         val scroll = VScroll(this, .45f).apply { setFadingEdgeLength(120.u) }
         val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false; clipToPadding = false; setPadding(114.u, 56.u, 114.u, 160.u) }
@@ -720,8 +738,8 @@ class HomeActivity : Activity() {
         val note = if (Glass.bg != "photo") "Wallpaper shows when Background is set to Photo." else null
         val page = sidebar("Wallpaper", note) { l ->
             header(l, "Your Photos")
-            row(l, "Photo Folder", value = { folderName() ?: "None" }, chevron = true) { withPhotos { folderPage() } }
-            row(l, "Add a Photo from This TV", icon = R.drawable.ic_image, chevron = true) { withPhotos { galleryPage() } }
+            row(l, "Photo Folder", value = { folderName() ?: "None" }, chevron = true) { withPhotos { loadThen({ Wall.folders(this) }, ::folderPage) } }
+            row(l, "Add a Photo from This TV", icon = R.drawable.ic_image, chevron = true) { withPhotos { loadThen(::recentPhotos, ::galleryPage) } }
             row(l, "Download from a Link", icon = R.drawable.ic_link, chevron = true) { askUrl() }
             header(l, "Photos")
             for ((id, name) in Wall.all(this)) {
@@ -777,10 +795,15 @@ class HomeActivity : Activity() {
         else toast("Still needs access to photos to show the ones on this TV.")
     }
 
-    private fun folderName() = prefs.folder?.let { id -> Wall.folders(this).firstOrNull { it.id == id }?.name ?: "Unavailable" }
+    private fun folderName() = prefs.folder?.let { prefs.folderName ?: "Photo Folder" }
 
-    private fun folderPage() {
-        val folders = Wall.folders(this)
+    /** Scans the photo library on a worker thread, then opens the page with the result. */
+    private fun <T> loadThen(load: () -> T, show: (T) -> Unit) = Ui.io.execute {
+        val r = load()
+        Ui.main.post { show(r) }
+    }
+
+    private fun folderPage(folders: List<Wall.Folder>) {
         var focus: View? = null
         val note = if (folders.isEmpty()) "No photos found. Copy images to this TV or connect a USB drive, then try again."
         else "Home shows the photos in this folder, newest first, and moves to the next one on the Rotate Wallpaper schedule."
@@ -797,7 +820,7 @@ class HomeActivity : Activity() {
                 val th = thumb()
                 Icons.async(th, "thumb:${f.cover}") { scaledThumb(Wall.decode({ Wall.open(this, f.cover) }, 256, 144)) }
                 val r = row(l, f.name, value = { "${f.count}" }, checked = { prefs.folder == f.id }, leading = th) {
-                    prefs.folder = f.id; prefs.wallpaper = f.cover
+                    prefs.folder = f.id; prefs.folderName = f.name; prefs.wallpaper = f.cover
                     // A folder is a slideshow; start one if rotation was off.
                     if (prefs[C.rotation] == "off") { prefs[C.rotation] = "15"; toast("Wallpaper will change every 15 minutes.") }
                     scheduleRotation()
@@ -811,16 +834,18 @@ class HomeActivity : Activity() {
 
     private val docIntent get() = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("image/*")
 
-    private fun galleryPage() {
-        val imgs = ArrayList<Pair<Long, String>>()
-        val src = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    private fun recentPhotos() = ArrayList<Pair<Long, String>>().also { imgs ->
         runCatching {
-            contentResolver.query(src, arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME), null, null,
+            contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME), null, null,
                 "${MediaStore.Images.Media.DATE_MODIFIED} DESC")?.use { c ->
                 // ponytail: newest 60 only; add paging if people keep big libraries on a TV
                 while (c.moveToNext() && imgs.size < 60) imgs += c.getLong(0) to (c.getString(1) ?: "Photo")
             }
         }
+    }
+
+    private fun galleryPage(imgs: List<Pair<Long, String>>) {
+        val src = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val canBrowse = docIntent.resolveActivity(packageManager) != null
         val note = if (imgs.isEmpty()) "No photos found. Copy images to this TV or connect a USB drive, then try again." else null
         push(sidebar("Photos on This TV", note) { l ->
